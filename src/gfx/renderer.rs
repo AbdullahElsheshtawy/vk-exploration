@@ -1,4 +1,3 @@
-use super::validation::Validation;
 use anyhow::Context;
 use ash::vk::{self, PhysicalDevice, PhysicalDeviceType};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -9,39 +8,28 @@ pub struct Renderer {
     physical_device: PhysicalDevice,
     device: ash::Device,
     surface: vk::SurfaceKHR,
-    validation: Option<Validation>,
+    surface_fns: ash::khr::surface::Instance,
 }
 
 impl Renderer {
-    pub fn new(debug: bool, window: &winit::window::Window) -> anyhow::Result<Self> {
+    pub fn new(window: &winit::window::Window) -> anyhow::Result<Self> {
         let entry = unsafe { ash::Entry::load() }?;
-        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
-        let mut extensions: Vec<*const i8> =
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"Vulkan Exploration")
+            .application_version(vk::make_api_version(0, 0, 1, 0))
+            .engine_name(c"Vulkan Exploration Engine")
+            .engine_version(vk::make_api_version(0, 0, 1, 0))
+            .api_version(vk::API_VERSION_1_3);
+        let required_extensions: Vec<*const i8> =
             ash_window::enumerate_required_extensions(window.display_handle()?.as_raw())?.into();
-        if debug {
-            extensions.push(c"VK_EXT_debug_utils".as_ptr());
-        }
 
-        let validation_layer_name = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
-        let mut debug_create_info = Validation::desc();
         let instance = {
-            let mut info = vk::InstanceCreateInfo::default()
+            let info = vk::InstanceCreateInfo::default()
                 .application_info(&app_info)
-                .enabled_extension_names(&extensions);
-            if debug {
-                info = info
-                    .enabled_layer_names(&validation_layer_name)
-                    .push_next(&mut debug_create_info);
-            }
+                .enabled_extension_names(&required_extensions);
 
             unsafe { entry.create_instance(&info, None) }
         }?;
-
-        let validation = if debug {
-            Some(Validation::new(&entry, &instance)?)
-        } else {
-            None
-        };
 
         let physical_device = choose_physical_device(&instance)?;
 
@@ -69,6 +57,7 @@ impl Renderer {
             unsafe { instance.create_device(physical_device, &info, None)? }
         };
 
+        let surface_fns = ash::khr::surface::Instance::new(&entry, &instance);
         let surface = unsafe {
             ash_window::create_surface(
                 &entry,
@@ -79,14 +68,13 @@ impl Renderer {
             )
         }?;
 
-        log::info!("Renderer has been successfull initialized");
         Ok(Self {
             entry,
             instance,
             physical_device,
             device,
             surface,
-            validation,
+            surface_fns,
         })
     }
 }
@@ -100,11 +88,7 @@ fn select_queue_family(
         .iter()
         .enumerate()
         .find(|(_, properties)| properties.queue_flags.contains(flags))
-        .map(|(idx, __)| idx as u32);
-
-    if index.is_none() {
-        log::error!("Selected GPU does not support {:?}", flags);
-    }
+        .map(|(idx, _)| idx as u32);
 
     index.ok_or(anyhow::anyhow!(format!(
         "Selected GPU does not support {:?}",
@@ -129,4 +113,16 @@ fn choose_physical_device(instance: &ash::Instance) -> anyhow::Result<PhysicalDe
             }
         })
         .context("No Graphics!")
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {
+            self.surface_fns.destroy_surface(self.surface, None);
+        };
+
+        unsafe { self.device.destroy_device(None) };
+
+        unsafe { self.instance.destroy_instance(None) };
+    }
 }
