@@ -2,13 +2,15 @@ use anyhow::Context;
 use ash::vk::{self, PhysicalDevice, PhysicalDeviceType};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
+use super::{surface::Surface, swapchain::Swapchain};
+
 pub struct Renderer {
     entry: ash::Entry,
     instance: ash::Instance,
     physical_device: PhysicalDevice,
     device: ash::Device,
-    surface: vk::SurfaceKHR,
-    surface_fns: ash::khr::surface::Instance,
+    surface: Surface,
+    swapchain: Swapchain,
 }
 
 impl Renderer {
@@ -57,16 +59,17 @@ impl Renderer {
             unsafe { instance.create_device(physical_device, &info, None)? }
         };
 
-        let surface_fns = ash::khr::surface::Instance::new(&entry, &instance);
-        let surface = unsafe {
-            ash_window::create_surface(
-                &entry,
-                &instance,
-                window.display_handle()?.as_raw(),
-                window.window_handle()?.as_raw(),
-                None,
-            )
-        }?;
+        let surface = Surface::new(&entry, &instance, &window)?;
+
+        let swapchain = Swapchain::new(
+            &instance,
+            &device,
+            physical_device,
+            &surface,
+            window.inner_size().width,
+            window.inner_size().height,
+            None,
+        )?;
 
         Ok(Self {
             entry,
@@ -74,7 +77,7 @@ impl Renderer {
             physical_device,
             device,
             surface,
-            surface_fns,
+            swapchain,
         })
     }
 }
@@ -117,12 +120,11 @@ fn choose_physical_device(instance: &ash::Instance) -> anyhow::Result<PhysicalDe
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        unsafe {
-            self.surface_fns.destroy_surface(self.surface, None);
-        };
+        // NOTE: swapchain MUST be destroyed before the surface
+        self.swapchain.destroy(&self.device);
+        self.surface.destroy();
 
         unsafe { self.device.destroy_device(None) };
-
         unsafe { self.instance.destroy_instance(None) };
     }
 }

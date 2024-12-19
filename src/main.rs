@@ -5,7 +5,6 @@ mod app;
 mod gfx;
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
     let event_loop = EventLoop::new()?;
 
     let mut app = App::new(WindowAttributes::default());
