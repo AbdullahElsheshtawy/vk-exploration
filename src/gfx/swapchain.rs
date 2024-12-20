@@ -2,12 +2,12 @@ use super::surface::Surface;
 use ash::vk::{self, PhysicalDevice};
 
 pub struct Swapchain {
-    fns: ash::khr::swapchain::Device,
-    swapchain: vk::SwapchainKHR,
-    images: Vec<vk::Image>,
-    views: Vec<vk::ImageView>,
-    format: vk::Format,
-    extent: vk::Extent2D,
+    pub fns: ash::khr::swapchain::Device,
+    pub swapchain: vk::SwapchainKHR,
+    pub images: Vec<vk::Image>,
+    pub views: Vec<vk::ImageView>,
+    pub format: vk::Format,
+    pub extent: vk::Extent2D,
 }
 impl Swapchain {
     pub fn new(

@@ -46,12 +46,13 @@ impl ApplicationHandler for App {
         event: winit::event::WindowEvent,
     ) {
         let window = self.window.as_ref().unwrap();
-        let _renderer = self.renderer.as_ref().unwrap();
-
         if window_id == window.id() {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
-                WindowEvent::RedrawRequested => window.request_redraw(),
+                WindowEvent::RedrawRequested => {
+                    window.request_redraw();
+                    self.renderer.as_mut().unwrap().draw().unwrap();
+                }
                 WindowEvent::KeyboardInput {
                     event:
                         KeyEvent {

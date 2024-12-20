@@ -1,8 +1,7 @@
-use anyhow::Context;
-use ash::vk::{self, PhysicalDevice, PhysicalDeviceType};
+use ash::vk::{self, PhysicalDevice};
 use winit::raw_window_handle::HasDisplayHandle;
 
-use super::{surface::Surface, swapchain::Swapchain};
+use super::{init, surface::Surface, swapchain::Swapchain, util};
 
 const FIF: usize = 2;
 
@@ -16,7 +15,7 @@ pub struct Renderer {
     queue: vk::Queue,
     gfx_queue_family_idx: u32,
     frames: [FrameData; FIF],
-    frame_num: usize,
+    frame_counter: usize,
 }
 
 impl Renderer {
@@ -39,10 +38,10 @@ impl Renderer {
             unsafe { entry.create_instance(&info, None) }
         }?;
 
-        let physical_device = choose_physical_device(&instance)?;
+        let physical_device = init::choose_physical_device(&instance)?;
 
         let gfx_queue_family_idx =
-            select_queue_family(&instance, physical_device, vk::QueueFlags::GRAPHICS)?;
+            init::select_queue_family(&instance, physical_device, vk::QueueFlags::GRAPHICS)?;
         let device = {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(gfx_queue_family_idx)
@@ -89,81 +88,171 @@ impl Renderer {
             queue,
             gfx_queue_family_idx,
             frames,
-            frame_num: 0,
+            frame_counter: 0,
         })
+    }
+
+    pub fn draw(&mut self) -> anyhow::Result<()> {
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.current_frame().render_fence], true, u64::MAX)?;
+            self.device
+                .reset_fences(&[self.current_frame().render_fence])?;
+        }
+
+        let (swapchain_image_idx, _) = unsafe {
+            self.swapchain.fns.acquire_next_image(
+                self.swapchain.swapchain,
+                u64::MAX,
+                self.current_frame().swapchain_sem,
+                vk::Fence::null(),
+            )
+        }?;
+
+        let cmd = self.current_frame().buffer;
+
+        unsafe {
+            self.device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            self.device.begin_command_buffer(
+                cmd,
+                &init::cmd_buffer_begin_info(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+        }
+
+        util::transition_image(
+            &self.device,
+            cmd,
+            self.swapchain.images[swapchain_image_idx as usize],
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
+        );
+
+        let flash = f32::abs(f32::sin(self.frame_counter as f32 / 120.0));
+        let clear_value = vk::ClearColorValue {
+            float32: [0.0, 0.0, flash, 1.0],
+        };
+
+        let clear_range = init::image_subresource_range(vk::ImageAspectFlags::COLOR);
+
+        unsafe {
+            self.device.cmd_clear_color_image(
+                cmd,
+                self.swapchain.images[swapchain_image_idx as usize],
+                vk::ImageLayout::GENERAL,
+                &clear_value,
+                &[clear_range],
+            )
+        };
+
+        util::transition_image(
+            &self.device,
+            cmd,
+            self.swapchain.images[swapchain_image_idx as usize],
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        );
+
+        unsafe { self.device.end_command_buffer(cmd) };
+
+        // Prepare the submission to the queue
+        // Wait on the present_sem as that semaphore is signaled when the swapchain is ready
+        // Signal on the render_sem to signal That renderering has finished
+        let cmd_info = init::cmd_buffer_submit_info(cmd);
+
+        let wait_info = init::sem_submit_info(
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            self.current_frame().swapchain_sem,
+        );
+        let signal_info = init::sem_submit_info(
+            vk::PipelineStageFlags2::ALL_GRAPHICS,
+            self.current_frame().rendering_sem,
+        );
+
+        let submit_info = init::submit_info(&cmd_info, Some(&signal_info), Some(&wait_info));
+        // Submit the command buffer and execute it
+        // render_fence will now block until the graphic commands finish execution
+        unsafe {
+            self.device.queue_submit2(
+                self.queue,
+                &[submit_info],
+                self.current_frame().render_fence,
+            )?;
+        }
+
+        // Present
+        // this will put the image just rendered into the visible window
+        // Wait on the render_sem for that as its necessary that drawing commands have finished before the image is displayed
+
+        let image_indices = [swapchain_image_idx];
+        let wait_sems = [self.current_frame().rendering_sem];
+        let swapchains = [self.swapchain.swapchain];
+        let present_info = vk::PresentInfoKHR::default()
+            .swapchains(&swapchains)
+            .wait_semaphores(&wait_sems)
+            .image_indices(&image_indices);
+
+        unsafe {
+            self.swapchain
+                .fns
+                .queue_present(self.queue, &present_info)?;
+        }
+
+        self.frame_counter += 1;
+        Ok(())
     }
 
     fn init_frame_data(
         device: &ash::Device,
         queue_family_idx: u32,
     ) -> anyhow::Result<[FrameData; FIF]> {
-        let pool_info = command_pool_create_info(
+        let mut frames: [FrameData; FIF] = core::array::from_fn(|_| FrameData::default());
+        let pool_info = init::cmd_pool_create_info(
             queue_family_idx,
             vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
         );
-        let mut frames: [FrameData; FIF] = core::array::from_fn(|_| FrameData::default());
-        (0..FIF).into_iter().for_each(|i| {
-            let pool = unsafe { device.create_command_pool(&pool_info, None) }
-                .expect(&format!("Could not Create command pool for FIF {}", i));
-            let buffer =
-                unsafe { device.allocate_command_buffers(&command_buffer_allocate_info(pool, 1)) }
-                    .expect(&format!(
-                        "Could not allocate command buffer/s for FIF {}",
-                        i
-                    ))[0];
-            frames[i] = FrameData { pool, buffer }
-        });
+
+        // Create the synchronization info
+        // One fence to control when the gpu has finished rendering a frame
+        // 2 semaphores to synchronize rendering with the swapchain
+        // The fence has to start SIGNALED so it can be waited on for the first frame
+        let fence_info = init::fence_create_info(vk::FenceCreateFlags::SIGNALED);
+        let sem_info = init::semaphore_create_info(vk::SemaphoreCreateFlags::empty());
+
+        for i in 0..FIF {
+            let pool = unsafe { device.create_command_pool(&pool_info, None) }?;
+            let buffer = unsafe {
+                device.allocate_command_buffers(&init::cmd_buffer_allocate_info(pool, 1))
+            }?[0];
+
+            let render_fence = unsafe { device.create_fence(&fence_info, None) }?;
+            let swapchain_sem = unsafe { device.create_semaphore(&sem_info, None) }?;
+            let rendering_sem = unsafe { device.create_semaphore(&sem_info, None) }?;
+            frames[i] = FrameData {
+                pool,
+                buffer,
+                swapchain_sem,
+                rendering_sem,
+                render_fence,
+            }
+        }
 
         Ok(frames)
     }
 
     pub fn current_frame(&self) -> &FrameData {
-        &self.frames[self.frame_num % FIF]
+        &self.frames[self.frame_counter % FIF]
     }
-}
-
-fn select_queue_family(
-    instance: &ash::Instance,
-    physical_device: PhysicalDevice,
-    flags: vk::QueueFlags,
-) -> anyhow::Result<u32> {
-    let index = unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
-        .iter()
-        .enumerate()
-        .find(|(_, properties)| properties.queue_flags.contains(flags))
-        .map(|(idx, _)| idx as u32);
-
-    index.ok_or(anyhow::anyhow!(format!(
-        "Selected GPU does not support {:?}",
-        flags
-    )))
-}
-fn choose_physical_device(instance: &ash::Instance) -> anyhow::Result<PhysicalDevice> {
-    unsafe { instance.enumerate_physical_devices() }?
-        .into_iter()
-        .max_by_key(|physical_device| {
-            match unsafe {
-                instance
-                    .get_physical_device_properties(*physical_device)
-                    .device_type
-            } {
-                PhysicalDeviceType::DISCRETE_GPU => 100,
-                PhysicalDeviceType::INTEGRATED_GPU => 75,
-                PhysicalDeviceType::VIRTUAL_GPU => 50,
-                PhysicalDeviceType::CPU => 25,
-                PhysicalDeviceType::OTHER => 10,
-                _ => 1,
-            }
-        })
-        .context("No Graphics!")
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
+        unsafe { self.device.device_wait_idle() };
         // NOTE: swapchain MUST be destroyed before the surface
         for frame in &self.frames {
             frame.destroy(&self.device);
         }
+
         self.swapchain.destroy(&self.device);
         self.surface.destroy();
 
@@ -171,34 +260,22 @@ impl Drop for Renderer {
         unsafe { self.instance.destroy_instance(None) };
     }
 }
-
-pub fn command_pool_create_info(
-    queue_family_idx: u32,
-    flags: vk::CommandPoolCreateFlags,
-) -> vk::CommandPoolCreateInfo<'static> {
-    vk::CommandPoolCreateInfo::default()
-        .flags(flags)
-        .queue_family_index(queue_family_idx)
-}
-
-pub fn command_buffer_allocate_info(
-    pool: vk::CommandPool,
-    count: u32,
-) -> vk::CommandBufferAllocateInfo<'static> {
-    vk::CommandBufferAllocateInfo::default()
-        .command_pool(pool)
-        .command_buffer_count(count)
-        .level(vk::CommandBufferLevel::PRIMARY)
-}
-
 #[derive(Debug, Default)]
-struct FrameData {
+pub struct FrameData {
     pub pool: vk::CommandPool,
     pub buffer: vk::CommandBuffer,
+    pub swapchain_sem: vk::Semaphore,
+    pub rendering_sem: vk::Semaphore,
+    pub render_fence: vk::Fence,
 }
 
 impl FrameData {
     pub fn destroy(&self, device: &ash::Device) {
-        unsafe { device.destroy_command_pool(self.pool, None) };
+        unsafe {
+            device.destroy_semaphore(self.swapchain_sem, None);
+            device.destroy_semaphore(self.rendering_sem, None);
+            device.destroy_fence(self.render_fence, None);
+            device.destroy_command_pool(self.pool, None);
+        }
     }
 }
